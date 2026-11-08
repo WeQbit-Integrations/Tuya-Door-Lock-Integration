@@ -60,14 +60,16 @@ exports.manageAccess = onCall({ secrets: [tuyaSecret], timeoutSeconds: 60 }, asy
     }
   }
 
-  if (data.action === 'create-one-time') {
+  if (data.action === 'create-one-time' || data.action === 'create-offline') {
+    const multiple = data.action === 'create-offline'
     const name = typeof data.name === 'string' ? data.name.trim() : ''
     if (!name || name.length > 80 || typeof data.requestId !== 'string' || !/^[a-f0-9-]{36}$/i.test(data.requestId)) throw new HttpsError('invalid-argument', 'Enter a visitor name and a valid request ID.')
-    const ref = db.collection('oneTimeAccess').doc(data.requestId)
+    if (multiple && (!Number.isSafeInteger(data.start) || !Number.isSafeInteger(data.end) || data.start <= 0 || data.end <= data.start || data.end <= Math.floor(Date.now() / 1000))) throw new HttpsError('invalid-argument', 'Select a valid start and future expiration time.')
+    const ref = db.collection(multiple ? 'offlineAccess' : 'oneTimeAccess').doc(data.requestId)
     try {
-      await ref.create({ name, state: 'submitting', createdBy: request.auth.uid, createdAt: FieldValue.serverTimestamp() })
+      await ref.create({ name, ...(multiple ? { requestedStart: data.start, requestedEnd: data.end } : {}), state: 'submitting', createdBy: request.auth.uid, createdAt: FieldValue.serverTimestamp() })
     } catch (error) {
-      if (error.code === 6 || error.code === 'already-exists') throw new HttpsError('already-exists', 'This request was already submitted. Check the one-time password list before retrying.')
+      if (error.code === 6 || error.code === 'already-exists') throw new HttpsError('already-exists', 'This request was already submitted. Check the password list before retrying.')
       throw new HttpsError('unavailable', 'Could not save the request. No password was requested.')
     }
     let submitted = false
@@ -75,17 +77,18 @@ exports.manageAccess = onCall({ secrets: [tuyaSecret], timeoutSeconds: 60 }, asy
     try {
       const token = await accessToken()
       submitted = true
-      const result = await tuyaRequest('POST', `/v1.1/devices/${deviceId}/door-lock/offline-temp-password`, { type: 'once', name }, token)
+      const body = multiple ? { type: 'multiple', name, effective_time: data.start, invalid_time: data.end } : { type: 'once', name }
+      const result = await tuyaRequest('POST', `/v1.1/devices/${deviceId}/door-lock/offline-temp-password`, body, token)
       const start = Number(result?.effective_time)
       const end = Number(result?.invalid_time)
-      if (typeof result?.offline_temp_password !== 'string' || !/^\d{4,20}$/.test(result.offline_temp_password) || !Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start <= 0 || end <= start) throw new Error('Tuya returned invalid one-time password data')
+      if (typeof result?.offline_temp_password !== 'string' || !/^\d{4,20}$/.test(result.offline_temp_password) || !Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start <= 0 || end <= start) throw new Error('Tuya returned invalid offline password data')
       generated = { pin: result.offline_temp_password, start, end }
       await ref.update({ ...generated, state: 'generated', updatedAt: FieldValue.serverTimestamp() })
       return { id: data.requestId, ...generated, stored: true }
     } catch (error) {
       await ref.update({ state: submitted ? 'unknown' : 'failed', updatedAt: FieldValue.serverTimestamp() }).catch(() => {})
       if (generated) return { id: data.requestId, ...generated, stored: false }
-      throw new HttpsError('unavailable', submitted ? 'The one-time password request could not be confirmed. Check Tuya before retrying.' : `No password was requested. ${error.message}`)
+      throw new HttpsError('unavailable', submitted ? 'The offline password request could not be confirmed. Check Tuya before retrying.' : `No password was requested. ${error.message}`)
     }
   }
 

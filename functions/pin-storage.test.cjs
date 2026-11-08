@@ -16,6 +16,8 @@ test('stores a seven-digit PIN in Firestore without changing the lock', { skip: 
   const ref = getFirestore().collection('visitorAccess').doc(requestId)
   const oneTimeId = crypto.randomUUID()
   const oneTimeRef = getFirestore().collection('oneTimeAccess').doc(oneTimeId)
+  const offlineId = crypto.randomUUID()
+  const offlineRef = getFirestore().collection('offlineAccess').doc(offlineId)
   const cipher = crypto.createCipheriv('aes-256-ecb', Buffer.from(process.env.TUYA_CLIENT_SECRET), null)
   const ticketKey = Buffer.concat([cipher.update('abcdefghijklmnop'), cipher.final()]).toString('hex')
   const now = Math.floor(Date.now() / 1000)
@@ -27,7 +29,12 @@ test('stores a seven-digit PIN in Firestore without changing the lock', { skip: 
     if (url.includes('/v1.0/token?')) return new Response(JSON.stringify({ success: true, result: { access_token: 'test-token' } }))
     if (url.endsWith('/password-ticket')) return new Response(JSON.stringify({ success: true, result: { ticket_id: 'ticket', ticket_key: ticketKey } }))
     if (url.endsWith('/offline-temp-password')) {
-      assert.deepEqual(JSON.parse(options.body), { type: 'once', name: 'One-time visitor' })
+      const body = JSON.parse(options.body)
+      if (body.type === 'multiple') {
+        assert.deepEqual(body, { type: 'multiple', name: 'Offline visitor', effective_time: now + 60, invalid_time: now + 7260 })
+        return new Response(JSON.stringify({ success: true, result: { offline_temp_password: '9876543210', effective_time: now, invalid_time: now + 7200 } }))
+      }
+      assert.deepEqual(body, { type: 'once', name: 'One-time visitor' })
       return new Response(JSON.stringify({ success: true, result: { offline_temp_password: '0123456789', effective_time: now, invalid_time: now + 21600 } }))
     }
     if (url.endsWith('/temp-password')) {
@@ -54,11 +61,24 @@ test('stores a seven-digit PIN in Firestore without changing the lock', { skip: 
     assert.equal(oneTime.stored, true)
     assert.equal((await oneTimeRef.get()).data().pin, '0123456789')
     await assert.rejects(manageAccess.run({ data: oneTimeRequest, auth: { uid: 'test-admin', token: { admin: true } } }), { code: 'already-exists' })
+    const offlineRequest = { action: 'create-offline', requestId: offlineId, name: 'Offline visitor', start: now + 60, end: now + 7260 }
+    await assert.rejects(manageAccess.run({ data: offlineRequest }), { code: 'unauthenticated' })
+    await assert.rejects(manageAccess.run({ data: { ...offlineRequest, end: offlineRequest.start }, auth: { uid: 'test-admin', token: { admin: true } } }), { code: 'invalid-argument' })
+    const offline = await manageAccess.run({ data: offlineRequest, auth: { uid: 'test-admin', token: { admin: true } } })
+    assert.deepEqual({ pin: offline.pin, start: offline.start, end: offline.end, stored: offline.stored }, { pin: '9876543210', start: now, end: now + 7200, stored: true })
+    const savedOffline = (await offlineRef.get()).data()
+    assert.equal(savedOffline.requestedStart, offlineRequest.start)
+    assert.equal(savedOffline.requestedEnd, offlineRequest.end)
+    assert.equal(savedOffline.start, now)
+    assert.equal(savedOffline.pin, '9876543210')
+    await assert.rejects(manageAccess.run({ data: offlineRequest, auth: { uid: 'test-admin', token: { admin: true } } }), { code: 'already-exists' })
     const documentUrl = `http://127.0.0.1:8080/v1/projects/demo-entrydesk/databases/(default)/documents/visitorAccess/${requestId}`
     const response = await realFetch(documentUrl)
     assert.equal(response.status, 403)
     const oneTimeDocumentUrl = `http://127.0.0.1:8080/v1/projects/demo-entrydesk/databases/(default)/documents/oneTimeAccess/${oneTimeId}`
     assert.equal((await realFetch(oneTimeDocumentUrl)).status, 403)
+    const offlineDocumentUrl = `http://127.0.0.1:8080/v1/projects/demo-entrydesk/databases/(default)/documents/offlineAccess/${offlineId}`
+    assert.equal((await realFetch(offlineDocumentUrl)).status, 403)
     const signup = await realFetch('http://127.0.0.1:9099/identitytoolkit.googleapis.com/v1/accounts:signUp?key=local-demo-key', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: `${requestId}@example.test`, password: 'local-test-only', returnSecureToken: true }),
@@ -68,6 +88,7 @@ test('stores a seven-digit PIN in Firestore without changing the lock', { skip: 
     const nonAdminResponse = await realFetch(documentUrl, { headers: { Authorization: `Bearer ${testUserToken}` } })
     assert.equal(nonAdminResponse.status, 403)
     assert.equal((await realFetch(oneTimeDocumentUrl, { headers: { Authorization: `Bearer ${testUserToken}` } })).status, 403)
+    assert.equal((await realFetch(offlineDocumentUrl, { headers: { Authorization: `Bearer ${testUserToken}` } })).status, 403)
   } finally {
     if (testUserToken) {
       await realFetch('http://127.0.0.1:9099/identitytoolkit.googleapis.com/v1/accounts:delete?key=local-demo-key', {
@@ -76,5 +97,6 @@ test('stores a seven-digit PIN in Firestore without changing the lock', { skip: 
     }
     await ref.delete()
     await oneTimeRef.delete()
+    await offlineRef.delete()
   }
 })
