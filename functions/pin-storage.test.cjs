@@ -28,14 +28,22 @@ test('stores a seven-digit PIN in Firestore without changing the lock', { skip: 
     if (!url.startsWith(process.env.TUYA_ENDPOINT)) return realFetch(url, options)
     if (url.includes('/v1.0/token?')) return new Response(JSON.stringify({ success: true, result: { access_token: 'test-token' } }))
     if (url.endsWith('/password-ticket')) return new Response(JSON.stringify({ success: true, result: { ticket_id: 'ticket', ticket_key: ticketKey } }))
+    if (url.includes('/door-lock/open-logs?')) {
+      const params = new URL(url).searchParams
+      assert.equal(params.get('page_no'), '1')
+      assert.equal(params.get('page_size'), '50')
+      assert.equal(params.get('start_time'), String((now - 86400) * 1000))
+      assert.equal(params.get('end_time'), String(now * 1000))
+      return new Response(JSON.stringify({ success: true, result: { total: 51, logs: [{ update_time: now * 1000, status: { code: 'unlock_temporary', value: '12345' } }] } }))
+    }
     if (url.endsWith('/offline-temp-password')) {
       const body = JSON.parse(options.body)
       if (body.type === 'multiple') {
         assert.deepEqual(body, { type: 'multiple', name: 'Offline visitor', effective_time: now + 60, invalid_time: now + 7260 })
-        return new Response(JSON.stringify({ success: true, result: { offline_temp_password: '9876543210', effective_time: now, invalid_time: now + 7200 } }))
+        return new Response(JSON.stringify({ success: true, result: { offline_temp_password_id: '67890', offline_temp_password: '9876543210', effective_time: now, invalid_time: now + 7200 } }))
       }
       assert.deepEqual(body, { type: 'once', name: 'One-time visitor' })
-      return new Response(JSON.stringify({ success: true, result: { offline_temp_password: '0123456789', effective_time: now, invalid_time: now + 21600 } }))
+      return new Response(JSON.stringify({ success: true, result: { offline_temp_password_id: '67891', offline_temp_password: '0123456789', effective_time: now, invalid_time: now + 21600 } }))
     }
     if (url.endsWith('/temp-password')) {
       assert.notEqual(JSON.parse(options.body).password, '0123456')
@@ -54,12 +62,22 @@ test('stores a seven-digit PIN in Firestore without changing the lock', { skip: 
     assert.equal(saved.pin, '0123456')
     assert.equal(saved.passwordId, '12345')
     assert.equal(saved.state, 'pending')
+    const logsRequest = { action: 'logs', start: now - 86400, end: now, page: 1 }
+    await assert.rejects(manageAccess.run({ data: logsRequest }), { code: 'unauthenticated' })
+    await assert.rejects(manageAccess.run({ data: logsRequest, auth: { uid: 'non-admin', token: {} } }), { code: 'permission-denied' })
+    await assert.rejects(manageAccess.run({ data: { ...logsRequest, start: now - 91 * 86400 }, auth: { uid: 'test-admin', token: { admin: true } } }), { code: 'invalid-argument' })
+    await assert.rejects(manageAccess.run({ data: { ...logsRequest, page: 0 }, auth: { uid: 'test-admin', token: { admin: true } } }), { code: 'invalid-argument' })
+    const logs = await manageAccess.run({ data: logsRequest, auth: { uid: 'test-admin', token: { admin: true } } })
+    assert.equal(logs.records[0].passwordId, '12345')
+    assert.equal(logs.records[0].time, now)
+    assert.equal(logs.hasMore, true)
     const oneTimeRequest = { action: 'create-one-time', requestId: oneTimeId, name: 'One-time visitor' }
     await assert.rejects(manageAccess.run({ data: oneTimeRequest }), { code: 'unauthenticated' })
     const oneTime = await manageAccess.run({ data: oneTimeRequest, auth: { uid: 'test-admin', token: { admin: true } } })
     assert.equal(oneTime.pin, '0123456789')
     assert.equal(oneTime.stored, true)
     assert.equal((await oneTimeRef.get()).data().pin, '0123456789')
+    assert.equal((await oneTimeRef.get()).data().passwordId, '67891')
     await assert.rejects(manageAccess.run({ data: oneTimeRequest, auth: { uid: 'test-admin', token: { admin: true } } }), { code: 'already-exists' })
     const offlineRequest = { action: 'create-offline', requestId: offlineId, name: 'Offline visitor', start: now + 60, end: now + 7260 }
     await assert.rejects(manageAccess.run({ data: offlineRequest }), { code: 'unauthenticated' })
@@ -71,6 +89,7 @@ test('stores a seven-digit PIN in Firestore without changing the lock', { skip: 
     assert.equal(savedOffline.requestedEnd, offlineRequest.end)
     assert.equal(savedOffline.start, now)
     assert.equal(savedOffline.pin, '9876543210')
+    assert.equal(savedOffline.passwordId, '67890')
     await assert.rejects(manageAccess.run({ data: offlineRequest, auth: { uid: 'test-admin', token: { admin: true } } }), { code: 'already-exists' })
     const documentUrl = `http://127.0.0.1:8080/v1/projects/demo-entrydesk/databases/(default)/documents/visitorAccess/${requestId}`
     const response = await realFetch(documentUrl)

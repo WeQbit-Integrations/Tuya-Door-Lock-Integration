@@ -1,3 +1,21 @@
+const { normalizeUnlockLogs } = require('./tuya.cjs')
+
+require('node:test').test('unlock history normalizes seconds and milliseconds without exposing raw credentials', () => {
+  const assert = require('node:assert/strict')
+  const result = normalizeUnlockLogs({ total: 2, logs: [
+    { update_time: 1794135600000, status: { code: 'unlock_temporary', value: 12345 }, nick_name: 'private', media_key: 'secret' },
+    { update_time: 1794135601, status: [{ code: 'unlock_offline_pd', value: 'secret-offline-code' }, { code: 'unlock_password', value: '7654321' }] },
+  ] })
+  assert.equal(result.records[0].time, 1794135600)
+  assert.equal(result.records[0].passwordId, '12345')
+  assert.equal(result.records[1].time, 1794135601)
+  assert.equal(result.records[1].passwordId, null)
+  assert.equal(result.records[2].passwordId, null)
+  assert.ok(!JSON.stringify(result).includes('secret'))
+  assert.ok(!JSON.stringify(result).includes('7654321'))
+  assert.throws(() => normalizeUnlockLogs({ total: 1, logs: [{ update_time: 'invalid' }] }))
+  assert.throws(() => normalizeUnlockLogs({ total: 0 }))
+})
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const crypto = require('node:crypto')

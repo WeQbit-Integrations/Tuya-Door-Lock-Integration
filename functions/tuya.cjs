@@ -36,4 +36,20 @@ function normalizePasswords(result) {
   })
 }
 
-module.exports = { signRequest, encryptPin, normalizePasswords }
+function normalizeUnlockLogs(result) {
+  if (!Array.isArray(result?.logs) || !Number.isSafeInteger(result.total) || result.total < 0) throw new Error('Unexpected unlock history from Tuya')
+  const records = result.logs.flatMap((entry, index) => {
+    const rawTime = Number(entry.update_time)
+    const time = rawTime >= 100000000000 ? Math.floor(rawTime / 1000) : rawTime
+    if (!Number.isSafeInteger(time) || time <= 0) throw new Error('Invalid unlock event time from Tuya')
+    const statuses = Array.isArray(entry.status) ? entry.status : entry.status ? [entry.status] : []
+    return statuses.map((status, statusIndex) => {
+      const method = typeof status.code === 'string' && /^unlock_[a-z_]{1,40}$/.test(status.code) ? status.code : 'unknown'
+      const value = typeof status.value === 'string' ? status.value : Number.isSafeInteger(status.value) ? String(status.value) : ''
+      return { id: `${time}-${index}-${statusIndex}`, time, method, passwordId: method === 'unlock_temporary' && /^\d{1,40}$/.test(value) ? value : null }
+    })
+  })
+  return { records, total: result.total }
+}
+
+module.exports = { signRequest, encryptPin, normalizePasswords, normalizeUnlockLogs }

@@ -2,7 +2,7 @@ const { initializeApp } = require('firebase-admin/app')
 const { getFirestore, FieldValue } = require('firebase-admin/firestore')
 const { onCall, HttpsError } = require('firebase-functions/v2/https')
 const { defineSecret, defineString } = require('firebase-functions/params')
-const { signRequest, encryptPin, normalizePasswords } = require('./tuya.cjs')
+const { signRequest, encryptPin, normalizePasswords, normalizeUnlockLogs } = require('./tuya.cjs')
 
 initializeApp()
 const db = getFirestore()
@@ -50,6 +50,19 @@ exports.manageAccess = onCall({ secrets: [tuyaSecret], timeoutSeconds: 60 }, asy
   if (!/^[a-zA-Z0-9_-]+$/.test(deviceId)) throw new HttpsError('failed-precondition', 'Invalid configured device ID.')
   const base = `/v1.0/devices/${deviceId}/door-lock`
 
+  if (data.action === 'logs') {
+    const page = data.page ?? 1
+    if (!Number.isSafeInteger(data.start) || !Number.isSafeInteger(data.end) || data.start <= 0 || data.end <= data.start || data.end > Math.floor(Date.now() / 1000) + 60 || data.end - data.start > 90 * 86400 || !Number.isSafeInteger(page) || page < 1 || page > 1000) throw new HttpsError('invalid-argument', 'Select a past date range of up to 90 days and a valid page.')
+    try {
+      const token = await accessToken()
+      const path = `/v1.1/devices/${deviceId}/door-lock/open-logs?page_no=${page}&page_size=50&start_time=${data.start * 1000}&end_time=${data.end * 1000}`
+      const result = normalizeUnlockLogs(await tuyaRequest('GET', path, undefined, token))
+      return { ...result, page, hasMore: page * 50 < result.total }
+    } catch (error) {
+      throw new HttpsError('unavailable', `Could not load unlock history from Tuya. ${error.message}`)
+    }
+  }
+
   if (data.action === 'list') {
     try {
       const token = await accessToken()
@@ -82,7 +95,9 @@ exports.manageAccess = onCall({ secrets: [tuyaSecret], timeoutSeconds: 60 }, asy
       const start = Number(result?.effective_time)
       const end = Number(result?.invalid_time)
       if (typeof result?.offline_temp_password !== 'string' || !/^\d{4,20}$/.test(result.offline_temp_password) || !Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start <= 0 || end <= start) throw new Error('Tuya returned invalid offline password data')
-      generated = { pin: result.offline_temp_password, start, end }
+      const rawPasswordId = result.offline_temp_password_id
+      const passwordId = typeof rawPasswordId === 'string' ? rawPasswordId : Number.isSafeInteger(rawPasswordId) ? String(rawPasswordId) : ''
+      generated = { pin: result.offline_temp_password, start, end, ...(/^\d{1,40}$/.test(passwordId) ? { passwordId } : {}) }
       await ref.update({ ...generated, state: 'generated', updatedAt: FieldValue.serverTimestamp() })
       return { id: data.requestId, ...generated, stored: true }
     } catch (error) {
