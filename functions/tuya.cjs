@@ -1,5 +1,11 @@
 const crypto = require('node:crypto')
 
+function canonicalTuyaPath(path) {
+  const url = new URL(path, 'https://tuya.invalid')
+  url.searchParams.sort()
+  return `${url.pathname}${url.search}`
+}
+
 function signRequest({ clientId, secret, token = '', timestamp, nonce = '', method, path, body = '' }) {
   const hash = crypto.createHash('sha256').update(body).digest('hex')
   const stringToSign = `${method}\n${hash}\n\n${path}`
@@ -36,6 +42,42 @@ function normalizePasswords(result) {
   })
 }
 
+function normalizeOfflinePasswords(result, page = 1) {
+  if (!Array.isArray(result?.records)) throw new Error('Unexpected offline password list from Tuya')
+  const total = Number(result.total ?? result.records.length)
+  if (!Number.isSafeInteger(total) || total < result.records.length) throw new Error('Invalid offline password count from Tuya')
+  const statuses = { 1: 'generated', 2: 'used', 3: 'invalid' }
+  const records = result.records.flatMap((entry) => {
+    if (entry.pwd_type_code && entry.pwd_type_code !== 'once') return []
+    const rawId = entry.pwd_id
+    const passwordId = typeof rawId === 'string' ? rawId : Number.isSafeInteger(rawId) ? String(rawId) : ''
+    const start = Number(entry.gmt_start)
+    const end = Number(entry.gmt_expired)
+    const createdAt = Number(entry.gmt_create)
+    if (!/^\d{1,40}$/.test(passwordId) || !Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start <= 0 || end <= 0) {
+      throw new Error('Invalid offline password metadata from Tuya')
+    }
+    return [{
+      id: `tuya-${passwordId}`,
+      passwordId,
+      name: typeof entry.pwd_name === 'string' && entry.pwd_name.trim() ? entry.pwd_name.trim() : 'Unnamed visitor',
+      type: typeof entry.pwd_type_code === 'string' ? entry.pwd_type_code : 'once',
+      start,
+      end,
+      ...(Number.isSafeInteger(createdAt) && createdAt > 0 ? { createdAt } : {}),
+      passwordType: Number.isSafeInteger(Number(entry.pwd_type)) ? Number(entry.pwd_type) : null,
+      statusCode: Number.isSafeInteger(Number(entry.status)) ? Number(entry.status) : null,
+      hasClearPassword: typeof entry.has_clear_pwd === 'boolean' ? entry.has_clear_pwd : null,
+      timeZone: typeof entry.time_zone_id === 'string' ? entry.time_zone_id : '',
+      state: statuses[Number(entry.status)] || 'unknown',
+      sourceTuya: true,
+    }]
+  })
+  const totalPages = Number(result.total_pages)
+  const hasMore = typeof result.has_more === 'boolean' ? result.has_more : Number.isSafeInteger(totalPages) && totalPages > page
+  return { records, total, hasMore }
+}
+
 function normalizeUnlockLogs(result) {
   if (!Array.isArray(result?.logs) || !Number.isSafeInteger(result.total) || result.total < 0) throw new Error('Unexpected unlock history from Tuya')
   const records = result.logs.flatMap((entry, index) => {
@@ -52,4 +94,4 @@ function normalizeUnlockLogs(result) {
   return { records, total: result.total }
 }
 
-module.exports = { signRequest, encryptPin, normalizePasswords, normalizeUnlockLogs }
+module.exports = { canonicalTuyaPath, signRequest, encryptPin, normalizePasswords, normalizeOfflinePasswords, normalizeUnlockLogs }

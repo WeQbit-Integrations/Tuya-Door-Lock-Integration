@@ -7,7 +7,18 @@
 .usage-range input{min-width:0;width:100%}
 .usage-range button{min-height:42px}
 .usage-dialog .banner svg{flex-shrink:0}
+.tuya-cloud-data{display:grid;gap:4px;min-width:220px;color:#68776f;font-size:10px;line-height:1.45}
+.tuya-cloud-data small{display:block;white-space:normal;overflow-wrap:anywhere}
+.tuya-cloud-data{display:grid;gap:4px;min-width:220px;color:#68776f;font-size:10px;line-height:1.45}
+.tuya-cloud-data small{display:block;white-space:normal;overflow-wrap:anywhere}
 .workspace.offline-workspace{grid-template-columns:minmax(0,1fr)}
+.offline-clear-warning{display:flex;align-items:flex-start;gap:8px;max-width:760px;margin-top:12px;color:#8e6335;font-size:12px;line-height:1.5}
+.offline-clear-warning svg{flex-shrink:0;margin-top:1px}
+.clear-all-button{margin-top:13px;color:#9e4b45;border-color:#ecd8d5}
+.clear-all-button:hover:not(:disabled){background:#fbf2f1;color:#873a34}
+.danger-button{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:40px;padding:0 14px;border:1px solid #a34a43;border-radius:5px;background:#a34a43;color:#fff;font-size:12px;font-weight:700}
+.danger-button:disabled{opacity:.5;cursor:not-allowed}
+.modal-actions{display:flex;justify-content:flex-end;align-items:center;gap:12px;margin-top:18px}
 .offline-create{order:-1}
 .offline-create form{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;align-items:start;margin-top:20px}
 .offline-create .input-group{display:contents}

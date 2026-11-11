@@ -2,7 +2,7 @@ const { initializeApp } = require('firebase-admin/app')
 const { getFirestore, FieldValue } = require('firebase-admin/firestore')
 const { onCall, HttpsError } = require('firebase-functions/v2/https')
 const { defineSecret, defineString } = require('firebase-functions/params')
-const { signRequest, encryptPin, normalizePasswords, normalizeUnlockLogs } = require('./tuya.cjs')
+const { canonicalTuyaPath, signRequest, encryptPin, normalizePasswords, normalizeOfflinePasswords, normalizeUnlockLogs } = require('./tuya.cjs')
 
 initializeApp()
 const db = getFirestore()
@@ -16,12 +16,13 @@ async function tuyaRequest(method, path, body, token = '') {
   const endpoint = tuyaEndpoint.value()
   if (!allowedEndpoints.includes(endpoint)) throw new Error('Unsupported Tuya API endpoint')
   const payload = body === undefined ? '' : JSON.stringify(body)
+  const requestPath = canonicalTuyaPath(path)
   const timestamp = Date.now().toString()
   const clientId = tuyaClientId.value()
-  const headers = { client_id: clientId, t: timestamp, sign_method: 'HMAC-SHA256', sign: signRequest({ clientId, secret: tuyaSecret.value(), token, timestamp, method, path, body: payload }) }
+  const headers = { client_id: clientId, t: timestamp, sign_method: 'HMAC-SHA256', sign: signRequest({ clientId, secret: tuyaSecret.value(), token, timestamp, method, path: requestPath, body: payload }) }
   if (token) headers.access_token = token
   if (payload) headers['Content-Type'] = 'application/json'
-  const response = await fetch(endpoint + path, { method, headers, ...(payload ? { body: payload } : {}), signal: AbortSignal.timeout(15000) })
+  const response = await fetch(endpoint + requestPath, { method, headers, ...(payload ? { body: payload } : {}), signal: AbortSignal.timeout(15000) })
   const result = await response.json()
   if (!response.ok || !result.success) throw new Error(`Tuya request failed (${result.code || response.status}): ${result.msg || 'Unknown error'}`)
   return result.result
@@ -70,6 +71,89 @@ exports.manageAccess = onCall({ secrets: [tuyaSecret], timeoutSeconds: 60 }, asy
       return { records: normalizePasswords(result) }
     } catch (error) {
       throw new HttpsError('unavailable', `Could not load temporary passwords from Tuya. ${error.message}`)
+    }
+  }
+
+  if (data.action === 'list-tuya-one-time') {
+    const page = data.page ?? 1
+    if (!Number.isSafeInteger(page) || page < 1 || page > 1000) throw new HttpsError('invalid-argument', 'Invalid offline password page.')
+    try {
+      const token = await accessToken()
+      const path = `/v1.0/devices/${deviceId}/door-lock/offline-temp-password?pageNo=${page}&pageSize=100&pwdTypeCodes=once&targetStatus=`
+      const result = normalizeOfflinePasswords(await tuyaRequest('GET', path, undefined, token), page)
+      return { ...result, page }
+    } catch (error) {
+      throw new HttpsError('unavailable', `Could not load one-time passwords from Tuya. ${error.message}`)
+    }
+  }
+
+  if (data.action === 'purge-one-time') {
+    if (typeof data.id !== 'string' || !/^[a-f0-9-]{36}$/i.test(data.id)) throw new HttpsError('invalid-argument', 'Invalid one-time password.')
+    const ref = db.collection('oneTimeAccess').doc(data.id)
+    let passwordId
+    try {
+      await db.runTransaction(async (transaction) => {
+        const snapshot = await transaction.get(ref)
+        if (!snapshot.exists) throw new HttpsError('not-found', 'One-time password not found.')
+        const saved = snapshot.data()
+        if (saved.state === 'purge-submitted') throw new HttpsError('failed-precondition', 'A purge request was already accepted by Tuya for this password.')
+        if (saved.state !== 'generated' || !/^\d{1,40}$/.test(String(saved.passwordId || ''))) throw new HttpsError('failed-precondition', 'This password has no confirmed Tuya ID and cannot be purged here.')
+        if (saved.purgeState === 'pending') throw new HttpsError('aborted', 'A purge request is already in progress.')
+        passwordId = String(saved.passwordId)
+        transaction.update(ref, { purgeState: 'pending', updatedAt: FieldValue.serverTimestamp() })
+      })
+    } catch (error) {
+      if (error instanceof HttpsError) throw error
+      throw new HttpsError('unavailable', 'Could not reserve this password for purging. No Tuya request was sent.')
+    }
+
+    try {
+      const token = await accessToken()
+      await tuyaRequest('POST', `/v1.1/devices/${deviceId}/door-lock/offline-temp-password`, { type: 'clear_one', password_id: passwordId }, token)
+      await ref.update({ state: 'purge-submitted', purgeState: 'submitted', purgeRequestedAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() })
+      return { state: 'purge-submitted' }
+    } catch (error) {
+      await ref.update({ purgeState: 'unknown', updatedAt: FieldValue.serverTimestamp() }).catch(() => {})
+      throw new HttpsError('unavailable', `Tuya did not confirm the purge. Check the Tuya app before retrying. ${error.message}`)
+    }
+  }
+
+  if (data.action === 'purge-all-offline') {
+    const requestId = data.requestId
+    if (data.confirmation !== 'CLEAR ALL OFFLINE PASSWORDS' || typeof requestId !== 'string' || !/^[a-f0-9-]{36}$/i.test(requestId)) throw new HttpsError('invalid-argument', 'Type CLEAR ALL OFFLINE PASSWORDS in the confirmation prompt.')
+    const auditRef = db.collection('offlineClearOperations').doc(requestId)
+    try {
+      await auditRef.create({ state: 'submitting', createdBy: request.auth.uid, createdAt: FieldValue.serverTimestamp() })
+    } catch (error) {
+      if (error.code === 6 || error.code === 'already-exists') throw new HttpsError('already-exists', 'This clear-all request was already submitted.')
+      throw new HttpsError('unavailable', 'Could not save the clear-all audit record. No Tuya request was sent.')
+    }
+
+    try {
+      const token = await accessToken()
+      await tuyaRequest('POST', `/v1.1/devices/${deviceId}/door-lock/offline-temp-password`, { type: 'clear_all' }, token)
+    } catch (error) {
+      await auditRef.update({ state: 'unknown', updatedAt: FieldValue.serverTimestamp() }).catch(() => {})
+      throw new HttpsError('unavailable', `Tuya did not confirm clearing offline passwords. Check Tuya before retrying. ${error.message}`)
+    }
+
+    let updatedRecords = 0
+    try {
+      for (const collectionName of ['oneTimeAccess', 'offlineAccess']) {
+        const snapshot = await db.collection(collectionName).get()
+        const records = snapshot.docs.filter((document) => /^\d{1,40}$/.test(String(document.data().passwordId || '')) && document.data().state !== 'purge-submitted')
+        for (let offset = 0; offset < records.length; offset += 450) {
+          const batch = db.batch()
+          for (const document of records.slice(offset, offset + 450)) batch.update(document.ref, { state: 'purge-submitted', purgeState: 'submitted', purgeRequestedAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() })
+          await batch.commit()
+          updatedRecords += records.slice(offset, offset + 450).length
+        }
+      }
+      await auditRef.update({ state: 'submitted', updatedRecords, updatedAt: FieldValue.serverTimestamp() })
+      return { state: 'purge-submitted', updatedRecords }
+    } catch {
+      await auditRef.update({ state: 'accepted-records-pending', updatedRecords, updatedAt: FieldValue.serverTimestamp() }).catch(() => {})
+      throw new HttpsError('unavailable', 'Tuya accepted the clear-all request, but some website records could not be updated. Check Tuya before taking any further action.')
     }
   }
 

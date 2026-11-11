@@ -16,6 +16,10 @@ test('stores a seven-digit PIN in Firestore without changing the lock', { skip: 
   const ref = getFirestore().collection('visitorAccess').doc(requestId)
   const oneTimeId = crypto.randomUUID()
   const oneTimeRef = getFirestore().collection('oneTimeAccess').doc(oneTimeId)
+  const clearAllRequestId = crypto.randomUUID()
+  const clearAllRef = getFirestore().collection('offlineClearOperations').doc(clearAllRequestId)
+  const legacyOneTimeId = crypto.randomUUID()
+  const legacyOneTimeRef = getFirestore().collection('oneTimeAccess').doc(legacyOneTimeId)
   const offlineId = crypto.randomUUID()
   const offlineRef = getFirestore().collection('offlineAccess').doc(offlineId)
   const cipher = crypto.createCipheriv('aes-256-ecb', Buffer.from(process.env.TUYA_CLIENT_SECRET), null)
@@ -23,6 +27,9 @@ test('stores a seven-digit PIN in Firestore without changing the lock', { skip: 
   const now = Math.floor(Date.now() / 1000)
   const realFetch = global.fetch
   let testUserToken
+  let clearOneRequests = 0
+  let failClearOne = true
+  let clearAllRequests = 0
 
   context.mock.method(global, 'fetch', async (url, options) => {
     if (!url.startsWith(process.env.TUYA_ENDPOINT)) return realFetch(url, options)
@@ -36,8 +43,25 @@ test('stores a seven-digit PIN in Firestore without changing the lock', { skip: 
       assert.equal(params.get('end_time'), String(now * 1000))
       return new Response(JSON.stringify({ success: true, result: { total: 51, logs: [{ update_time: now * 1000, status: { code: 'unlock_temporary', value: '12345' } }] } }))
     }
+    if (url.includes('/door-lock/offline-temp-password?')) {
+      const requestUrl = new URL(url)
+      const page = requestUrl.searchParams.get('pageNo')
+      assert.equal(requestUrl.search, `?pageNo=${page}&pageSize=100&pwdTypeCodes=once&targetStatus=`)
+      return new Response(JSON.stringify({ success: true, result: { total: 101, has_more: page === '1', records: [{ pwd_id: page === '1' ? '67891' : '67892', pwd_name: page === '1' ? 'One-time visitor' : 'Second page visitor', pwd_type_code: 'once', gmt_create: now, gmt_start: now, gmt_expired: now + 21600, status: 1, password: 'must-not-be-returned' }] } }))
+    }
     if (url.endsWith('/offline-temp-password')) {
       const body = JSON.parse(options.body)
+      if (body.type === 'clear_one') {
+        clearOneRequests += 1
+        assert.deepEqual(body, { type: 'clear_one', password_id: '67891' })
+        if (failClearOne) return new Response(JSON.stringify({ success: false, code: 500, msg: 'Mock purge failure' }))
+        return new Response(JSON.stringify({ success: true, result: true }))
+      }
+      if (body.type === 'clear_all') {
+        clearAllRequests += 1
+        assert.deepEqual(body, { type: 'clear_all' })
+        return new Response(JSON.stringify({ success: true, result: true }))
+      }
       if (body.type === 'multiple') {
         assert.deepEqual(body, { type: 'multiple', name: 'Offline visitor', effective_time: now + 60, invalid_time: now + 7260 })
         return new Response(JSON.stringify({ success: true, result: { offline_temp_password_id: '67890', offline_temp_password: '9876543210', effective_time: now, invalid_time: now + 7200 } }))
@@ -71,6 +95,19 @@ test('stores a seven-digit PIN in Firestore without changing the lock', { skip: 
     assert.equal(logs.records[0].passwordId, '12345')
     assert.equal(logs.records[0].time, now)
     assert.equal(logs.hasMore, true)
+    const cloudListRequest = { action: 'list-tuya-one-time', page: 1 }
+    await assert.rejects(manageAccess.run({ data: cloudListRequest }), { code: 'unauthenticated' })
+    await assert.rejects(manageAccess.run({ data: cloudListRequest, auth: { uid: 'non-admin', token: {} } }), { code: 'permission-denied' })
+    const cloudList = await manageAccess.run({ data: cloudListRequest, auth: { uid: 'test-admin', token: { admin: true } } })
+    assert.equal(cloudList.total, 101)
+    assert.equal(cloudList.hasMore, true)
+    assert.equal(cloudList.records[0].name, 'One-time visitor')
+    assert.equal(cloudList.records[0].state, 'generated')
+    assert.equal(cloudList.records[0].passwordId, '67891')
+    assert.ok(!JSON.stringify(cloudList).includes('must-not-be-returned'))
+    const cloudListPageTwo = await manageAccess.run({ data: { ...cloudListRequest, page: 2 }, auth: { uid: 'test-admin', token: { admin: true } } })
+    assert.equal(cloudListPageTwo.hasMore, false)
+    assert.equal(cloudListPageTwo.records[0].name, 'Second page visitor')
     const oneTimeRequest = { action: 'create-one-time', requestId: oneTimeId, name: 'One-time visitor' }
     await assert.rejects(manageAccess.run({ data: oneTimeRequest }), { code: 'unauthenticated' })
     const oneTime = await manageAccess.run({ data: oneTimeRequest, auth: { uid: 'test-admin', token: { admin: true } } })
@@ -79,6 +116,21 @@ test('stores a seven-digit PIN in Firestore without changing the lock', { skip: 
     assert.equal((await oneTimeRef.get()).data().pin, '0123456789')
     assert.equal((await oneTimeRef.get()).data().passwordId, '67891')
     await assert.rejects(manageAccess.run({ data: oneTimeRequest, auth: { uid: 'test-admin', token: { admin: true } } }), { code: 'already-exists' })
+    await legacyOneTimeRef.create({ name: 'Legacy one-time record', state: 'generated' })
+    await assert.rejects(manageAccess.run({ data: { action: 'purge-one-time', id: legacyOneTimeId }, auth: { uid: 'test-admin', token: { admin: true } } }), { code: 'failed-precondition' })
+    assert.equal(clearOneRequests, 0)
+    await assert.rejects(manageAccess.run({ data: { action: 'purge-one-time', id: oneTimeId } }), { code: 'unauthenticated' })
+    await assert.rejects(manageAccess.run({ data: { action: 'purge-one-time', id: oneTimeId }, auth: { uid: 'non-admin', token: {} } }), { code: 'permission-denied' })
+    await assert.rejects(manageAccess.run({ data: { action: 'purge-one-time', id: offlineId }, auth: { uid: 'test-admin', token: { admin: true } } }), { code: 'not-found' })
+    await assert.rejects(manageAccess.run({ data: { action: 'purge-one-time', id: oneTimeId }, auth: { uid: 'test-admin', token: { admin: true } } }), { code: 'unavailable' })
+    assert.equal((await oneTimeRef.get()).data().purgeState, 'unknown')
+    failClearOne = false
+    assert.deepEqual(await manageAccess.run({ data: { action: 'purge-one-time', id: oneTimeId }, auth: { uid: 'test-admin', token: { admin: true } } }), { state: 'purge-submitted' })
+    assert.equal((await oneTimeRef.get()).data().purgeState, 'submitted')
+    assert.equal((await oneTimeRef.get()).data().state, 'purge-submitted')
+    assert.equal(clearOneRequests, 2)
+    await assert.rejects(manageAccess.run({ data: { action: 'purge-one-time', id: oneTimeId }, auth: { uid: 'test-admin', token: { admin: true } } }), { code: 'failed-precondition' })
+    assert.equal(clearOneRequests, 2)
     const offlineRequest = { action: 'create-offline', requestId: offlineId, name: 'Offline visitor', start: now + 60, end: now + 7260 }
     await assert.rejects(manageAccess.run({ data: offlineRequest }), { code: 'unauthenticated' })
     await assert.rejects(manageAccess.run({ data: { ...offlineRequest, end: offlineRequest.start }, auth: { uid: 'test-admin', token: { admin: true } } }), { code: 'invalid-argument' })
@@ -91,6 +143,18 @@ test('stores a seven-digit PIN in Firestore without changing the lock', { skip: 
     assert.equal(savedOffline.pin, '9876543210')
     assert.equal(savedOffline.passwordId, '67890')
     await assert.rejects(manageAccess.run({ data: offlineRequest, auth: { uid: 'test-admin', token: { admin: true } } }), { code: 'already-exists' })
+    const clearAllRequest = { action: 'purge-all-offline', requestId: clearAllRequestId, confirmation: 'CLEAR ALL OFFLINE PASSWORDS' }
+    await assert.rejects(manageAccess.run({ data: clearAllRequest }), { code: 'unauthenticated' })
+    await assert.rejects(manageAccess.run({ data: clearAllRequest, auth: { uid: 'non-admin', token: {} } }), { code: 'permission-denied' })
+    await assert.rejects(manageAccess.run({ data: { ...clearAllRequest, confirmation: 'clear all' }, auth: { uid: 'test-admin', token: { admin: true } } }), { code: 'invalid-argument' })
+    assert.equal(clearAllRequests, 0)
+    const cleared = await manageAccess.run({ data: clearAllRequest, auth: { uid: 'test-admin', token: { admin: true } } })
+    assert.deepEqual(cleared, { state: 'purge-submitted', updatedRecords: 1 })
+    assert.equal(clearAllRequests, 1)
+    assert.equal((await clearAllRef.get()).data().state, 'submitted')
+    assert.equal((await oneTimeRef.get()).data().purgeState, 'submitted')
+    assert.equal((await offlineRef.get()).data().state, 'purge-submitted')
+    assert.equal((await ref.get()).data().state, 'pending')
     const documentUrl = `http://127.0.0.1:8080/v1/projects/demo-entrydesk/databases/(default)/documents/visitorAccess/${requestId}`
     const response = await realFetch(documentUrl)
     assert.equal(response.status, 403)
@@ -116,6 +180,8 @@ test('stores a seven-digit PIN in Firestore without changing the lock', { skip: 
     }
     await ref.delete()
     await oneTimeRef.delete()
+    await clearAllRef.delete()
+    await legacyOneTimeRef.delete()
     await offlineRef.delete()
   }
 })

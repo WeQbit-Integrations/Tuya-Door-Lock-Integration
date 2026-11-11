@@ -1,4 +1,4 @@
-const { normalizeUnlockLogs } = require('./tuya.cjs')
+const { canonicalTuyaPath, normalizeOfflinePasswords, normalizeUnlockLogs } = require('./tuya.cjs')
 
 require('node:test').test('unlock history normalizes seconds and milliseconds without exposing raw credentials', () => {
   const assert = require('node:assert/strict')
@@ -48,4 +48,28 @@ test('rejects malformed or unsafe Tuya password metadata', () => {
   assert.throws(() => normalizePasswords({ records: [] }))
   assert.throws(() => normalizePasswords([{ password_id: Number.MAX_SAFE_INTEGER + 1, effective_time: 1, invalid_time: 2 }]))
   assert.throws(() => normalizePasswords([{ password_id: 1, effective_time: null, invalid_time: 2 }]))
+})
+
+test('canonicalizes Tuya query order and normalizes offline metadata without PIN values', () => {
+  assert.equal(canonicalTuyaPath('/lock?pwdTypeCodes=once&targetStatus=&pageNo=1&pageSize=100'), '/lock?pageNo=1&pageSize=100&pwdTypeCodes=once&targetStatus=')
+  const result = normalizeOfflinePasswords({ total: 2, has_more: false, records: [
+    { pwd_id: '12345', pwd_name: 'OneT1', pwd_type: 1, pwd_type_code: 'once', has_clear_pwd: false, time_zone_id: 'Asia/Colombo', gmt_create: 1794252369, gmt_start: '1794250800', gmt_expired: '1794272400', status: 1, password: 'secret-code' },
+    { pwd_id: 67890, pwd_name: 'Used once', pwd_type_code: 'once', gmt_start: '1794250800', gmt_expired: '1794272400', status: 2 },
+  ] })
+  assert.equal(result.total, 2)
+  assert.equal(result.records[0].name, 'OneT1')
+  assert.equal(result.records[0].id, 'tuya-12345')
+  assert.equal(result.records[0].state, 'generated')
+  assert.equal(result.records[0].type, 'once')
+  assert.equal(result.records[0].createdAt, 1794252369)
+  assert.equal(result.records[0].passwordType, 1)
+  assert.equal(result.records[0].statusCode, 1)
+  assert.equal(result.records[0].hasClearPassword, false)
+  assert.equal(result.records[0].timeZone, 'Asia/Colombo')
+  assert.equal(result.records[0].hasClearPassword, false)
+  assert.equal(result.records[1].passwordId, '67890')
+  assert.equal(result.records[1].state, 'used')
+  assert.ok(result.records.every((record) => !('pin' in record) && !('password' in record)))
+  assert.ok(!JSON.stringify(result).includes('secret-code'))
+  assert.throws(() => normalizeOfflinePasswords({ records: [{ pwd_id: '1', gmt_start: 'bad', gmt_expired: '2' }] }))
 })
